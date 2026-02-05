@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Streamlink IGT Timer Capture Server - Render.com Deployment Version"""
+"""Streamlink IGT Timer Capture Server - Fixed for Render.com"""
 
 import asyncio
 import json
@@ -17,37 +17,18 @@ import numpy as np
 import cv2
 import websockets
 from websockets.legacy.server import WebSocketServerProtocol
-import http.server
-import socketserver
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration
+# CRITICAL: Must use 0.0.0.0, not localhost
 PORT = int(os.environ.get("PORT", 10000))
-HOST = "0.0.0.0"  # Required for Render
+HOST = "0.0.0.0"
 
 @dataclass
 class StreamConfig:
     url: str
     quality: str = "best"
-
-class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
-    """HTTP Health check server for Render"""
-    def do_GET(self):
-        if self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK")
-        else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def log_message(self, format, *args):
-        # Suppress health check logs
-        if "/health" not in args[0]:
-            logger.info(args[0])
 
 class StreamCapture:
     def __init__(self):
@@ -156,7 +137,7 @@ class StreamCapture:
             ffmpeg_cmd = [
                 'ffmpeg',
                 '-hide_banner', '-loglevel', 'error',
-                '-i', 'pipe:0',      # Read from stdin (streamlink output)
+                '-i', 'pipe:0',
                 '-f', 'rawvideo',
                 '-pix_fmt', 'bgr24',
                 '-s', '1920x1080',
@@ -237,47 +218,44 @@ class StreamCapture:
             self.capture_thread.join(timeout=3)
         logger.info("Stream stopped")
 
+
 class WebSocketServer:
     def __init__(self):
         self.capture = StreamCapture()
-        self.health_check_server = None
 
-    def start_health_check(self):
-        """Start HTTP server for Render health checks"""
-        with socketserver.TCPServer((HOST, 8080), HealthCheckHandler) as httpd:
-            self.health_check_server = httpd
-            httpd.serve_forever()
-
-    async def handle_client(self, websocket: WebSocketServerProtocol):
-        logger.info(f"Client connected: {websocket.remote_address}")
+    async def handle_client(self, websocket: WebSocketServerProtocol, path):
+        """Handle client connections with path parameter"""
+        logger.info(f"Client connected: {websocket.remote_address} | Path: {path}")
         self.capture.subscribers.add(websocket)
         
         try:
             async for message in websocket:
-                data = json.loads(message)
-                action = data.get('action')
-                
-                if action == 'START_STREAM':
-                    success = await self.capture.start_stream(data.get('url'), data.get('quality', 'best'))
-                    await websocket.send(json.dumps({'type': 'STATUS', 'action': 'START_STREAM', 'success': success}))
-                
-                elif action == 'STOP_STREAM':
-                    self.capture.stop()
-                    await websocket.send(json.dumps({'type': 'STATUS', 'action': 'STOP_STREAM', 'success': True}))
-                
-                elif action == 'PING':
-                    await websocket.send(json.dumps({'type': 'PONG'}))
+                try:
+                    data = json.loads(message)
+                    action = data.get('action')
                     
-        except websockets.exceptions.ConnectionClosed:
-            logger.info(f"Client disconnected")
+                    if action == 'START_STREAM':
+                        success = await self.capture.start_stream(data.get('url'), data.get('quality', 'best'))
+                        await websocket.send(json.dumps({'type': 'STATUS', 'action': 'START_STREAM', 'success': success}))
+                    
+                    elif action == 'STOP_STREAM':
+                        self.capture.stop()
+                        await websocket.send(json.dumps({'type': 'STATUS', 'action': 'STOP_STREAM', 'success': True}))
+                    
+                    elif action == 'PING':
+                        await websocket.send(json.dumps({'type': 'PONG'}))
+                except json.JSONDecodeError:
+                    logger.error(f"Invalid JSON received: {message}")
+                    await websocket.send(json.dumps({'type': 'ERROR', 'message': 'Invalid JSON'}))
+                    
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.info(f"Client disconnected: {e}")
+        except Exception as e:
+            logger.error(f"Error handling client: {e}")
         finally:
             self.capture.subscribers.discard(websocket)
 
     async def start(self):
-        # Start health check server in separate thread
-        health_thread = threading.Thread(target=self.start_health_check, daemon=True)
-        health_thread.start()
-        
         # Setup graceful shutdown
         loop = asyncio.get_running_loop()
         stop = loop.create_future()
@@ -291,18 +269,22 @@ class WebSocketServer:
             loop.add_signal_handler(sig, shutdown)
         
         # Start WebSocket server
-        # Render routes all traffic to port 10000 (or $PORT)
-        server = await websockets.serve(
+        logger.info(f"Starting WebSocket server on {HOST}:{PORT}")
+        
+        async with websockets.serve(
             self.handle_client, 
             HOST, 
             PORT,
             ping_interval=20,
-            ping_timeout=10
-        )
-        logger.info(f"Server started on ws://{HOST}:{PORT}")
-        await stop
-        server.close()
-        await server.wait_closed()
+            ping_timeout=10,
+            compression=None,  # Disable compression to avoid proxy issues
+            subprotocols=None  # Disable subprotocol negotiation
+        ) as server:
+            logger.info(f"Server started successfully on ws://{HOST}:{PORT}")
+            await stop
+            server.close()
+            await server.wait_closed()
+
 
 async def main():
     await WebSocketServer().start()
