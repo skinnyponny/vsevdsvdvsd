@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: streamlink-igt-server
+    runtime: python
+    plan: standard  # Free tier has 15-min timeout; use Standard for production
+    buildCommand: "./build.sh"
+    startCommand: "python server.py"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: PORT
+        value: 10000
+    healthCheckPath: /health
