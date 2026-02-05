@@ -2,7 +2,6 @@
 """Streamlink IGT Timer Capture Server - Fixed for Render.com"""
 
 import asyncio
-import http
 import json
 import logging
 import os
@@ -224,9 +223,35 @@ class WebSocketServer:
     def __init__(self):
         self.capture = StreamCapture()
 
-    async def handle_client(self, websocket: WebSocketServerProtocol):
-        """Handle WebSocket client connections"""
-        logger.info(f"Client connected: {websocket.remote_address}")
+    async def process_request(self, path, request_headers):
+        """Handle HTTP requests - allows health checks and browser connections"""
+        if path == "/health":
+            return (
+                200,
+                [("Content-Type", "text/plain")],
+                b"OK - WebSocket Server Running\n"
+            )
+        elif path == "/":
+            html = b"""<!DOCTYPE html>
+<html>
+<head><title>WebSocket Server</title></head>
+<body>
+<h1>WebSocket Server Running</h1>
+<p>Connect using WebSocket protocol: <code>ws://""" + f"{HOST}:{PORT}".encode() + b"""</code></p>
+<p>Health check: <a href="/health">/health</a></p>
+</body>
+</html>"""
+            return (
+                200,
+                [("Content-Type", "text/html")],
+                html
+            )
+        # Return None to let websockets handle WebSocket upgrade
+        return None
+
+    async def handle_client(self, websocket: WebSocketServerProtocol, path):
+        """Handle client connections with path parameter"""
+        logger.info(f"Client connected: {websocket.remote_address} | Path: {path}")
         self.capture.subscribers.add(websocket)
         
         try:
@@ -256,13 +281,6 @@ class WebSocketServer:
         finally:
             self.capture.subscribers.discard(websocket)
 
-    async def health_check(self, path, request_headers):
-        """Handle HTTP health check requests (required for Render)"""
-        if path == "/healthz" or path == "/health":
-            return (http.HTTPStatus.OK, [], b"OK\n")
-        # Return None to let websockets handle it as a WebSocket connection
-        return None
-
     async def start(self):
         # Setup graceful shutdown
         loop = asyncio.get_running_loop()
@@ -276,20 +294,21 @@ class WebSocketServer:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, shutdown)
         
+        # Start WebSocket server
         logger.info(f"Starting WebSocket server on {HOST}:{PORT}")
         
-        # CRITICAL FIX: Use process_request to handle HTTP health checks
-        # This prevents 426 Upgrade Required errors from Render's health checks
         async with websockets.serve(
             self.handle_client, 
             HOST, 
             PORT,
-            process_request=self.health_check,  # Handle HTTP requests properly
+            process_request=self.process_request,  # Handle HTTP health checks
             ping_interval=20,
             ping_timeout=10,
+            compression=None,  # Disable compression to avoid proxy issues
+            subprotocols=None  # Disable subprotocol negotiation
         ) as server:
             logger.info(f"Server started successfully on ws://{HOST}:{PORT}")
-            logger.info(f"Health check available at http://{HOST}:{PORT}/healthz")
+            logger.info(f"Health check available at http://{HOST}:{PORT}/health")
             await stop
             server.close()
             await server.wait_closed()
