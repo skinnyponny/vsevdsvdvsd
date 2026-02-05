@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Streamlink IGT Timer Capture Server - Fixed for Render.com"""
+"""Streamlink IGT Timer Capture Server - Enhanced Debugging Version"""
 
 import asyncio
 import json
@@ -18,7 +18,11 @@ import cv2
 import websockets
 from websockets.legacy.server import WebSocketServerProtocol
 
-logging.basicConfig(level=logging.INFO)
+# Enhanced logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # CRITICAL: Must use 0.0.0.0, not localhost
@@ -224,62 +228,140 @@ class WebSocketServer:
         self.capture = StreamCapture()
 
     async def process_request(self, path, request_headers):
-        """Handle HTTP requests - allows health checks and browser connections"""
+        """Handle HTTP requests with detailed logging"""
+        logger.info(f"━━━ Incoming Request ━━━")
+        logger.info(f"Path: {path}")
+        logger.info(f"Method: {request_headers.get('method', 'N/A')}")
+        
+        # Log all headers for debugging
+        for key, value in request_headers.items():
+            logger.info(f"Header: {key} = {value}")
+        
+        # Health check endpoint
         if path == "/health":
+            logger.info("✓ Health check endpoint")
             return (
                 200,
                 [("Content-Type", "text/plain")],
                 b"OK - WebSocket Server Running\n"
             )
-        elif path == "/":
-            html = b"""<!DOCTYPE html>
+        
+        # Root endpoint with info page
+        if path == "/":
+            logger.info("✓ Root endpoint - serving info page")
+            html = f"""<!DOCTYPE html>
 <html>
-<head><title>WebSocket Server</title></head>
+<head>
+    <title>WebSocket Server</title>
+    <style>
+        body {{ font-family: monospace; padding: 20px; background: #1e1e1e; color: #d4d4d4; }}
+        code {{ background: #2d2d2d; padding: 2px 6px; border-radius: 3px; }}
+        .good {{ color: #4ec9b0; }}
+    </style>
+</head>
 <body>
-<h1>WebSocket Server Running</h1>
-<p>Connect using WebSocket protocol: <code>ws://""" + f"{HOST}:{PORT}".encode() + b"""</code></p>
-<p>Health check: <a href="/health">/health</a></p>
+    <h1>🟢 WebSocket Server Running</h1>
+    <p>Server: <code>{HOST}:{PORT}</code></p>
+    <p>WebSocket URL: <code class="good">ws://{HOST}:{PORT}</code></p>
+    <p>Health Check: <a href="/health">/health</a></p>
+    <hr>
+    <h3>Client Connection Example:</h3>
+    <pre><code>const ws = new WebSocket('ws://{HOST}:{PORT}');
+ws.onopen = () => ws.send(JSON.stringify({{action: 'PING'}}));</code></pre>
 </body>
 </html>"""
             return (
                 200,
                 [("Content-Type", "text/html")],
-                html
+                html.encode()
             )
-        # Return None to let websockets handle WebSocket upgrade
-        return None
+        
+        # Check for WebSocket upgrade headers
+        upgrade = request_headers.get("Upgrade", "").lower()
+        connection = request_headers.get("Connection", "").lower()
+        ws_key = request_headers.get("Sec-WebSocket-Key", "")
+        ws_version = request_headers.get("Sec-WebSocket-Version", "")
+        
+        logger.info(f"Upgrade: '{upgrade}'")
+        logger.info(f"Connection: '{connection}'")
+        logger.info(f"WS-Key: '{ws_key}'")
+        logger.info(f"WS-Version: '{ws_version}'")
+        
+        # Valid WebSocket upgrade must have all required headers
+        if upgrade == "websocket" and "upgrade" in connection and ws_key:
+            logger.info("✓ Valid WebSocket upgrade - passing to websockets library")
+            return None  # Let websockets library handle it
+        else:
+            logger.warning("✗ Invalid WebSocket request - missing required headers")
+            logger.warning(f"  Expected: Upgrade=websocket, Connection=upgrade, Sec-WebSocket-Key=<present>")
+            logger.warning(f"  Got: Upgrade={upgrade}, Connection={connection}, Key={'present' if ws_key else 'missing'}")
+            
+            return (
+                400,
+                [("Content-Type", "text/plain")],
+                b"Bad Request - Invalid WebSocket upgrade headers\n"
+            )
 
     async def handle_client(self, websocket: WebSocketServerProtocol, path):
-        """Handle client connections with path parameter"""
-        logger.info(f"Client connected: {websocket.remote_address} | Path: {path}")
+        """Handle WebSocket client connections"""
+        client_info = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
+        logger.info(f"✓ WebSocket client connected: {client_info} | Path: {path}")
         self.capture.subscribers.add(websocket)
         
         try:
+            # Send welcome message
+            await websocket.send(json.dumps({
+                'type': 'WELCOME',
+                'message': 'Connected to IGT Timer Capture Server',
+                'timestamp': time.time()
+            }))
+            
             async for message in websocket:
                 try:
                     data = json.loads(message)
                     action = data.get('action')
+                    logger.info(f"Received action from {client_info}: {action}")
                     
                     if action == 'START_STREAM':
                         success = await self.capture.start_stream(data.get('url'), data.get('quality', 'best'))
-                        await websocket.send(json.dumps({'type': 'STATUS', 'action': 'START_STREAM', 'success': success}))
+                        await websocket.send(json.dumps({
+                            'type': 'STATUS',
+                            'action': 'START_STREAM',
+                            'success': success
+                        }))
                     
                     elif action == 'STOP_STREAM':
                         self.capture.stop()
-                        await websocket.send(json.dumps({'type': 'STATUS', 'action': 'STOP_STREAM', 'success': True}))
+                        await websocket.send(json.dumps({
+                            'type': 'STATUS',
+                            'action': 'STOP_STREAM',
+                            'success': True
+                        }))
                     
                     elif action == 'PING':
-                        await websocket.send(json.dumps({'type': 'PONG'}))
-                except json.JSONDecodeError:
-                    logger.error(f"Invalid JSON received: {message}")
-                    await websocket.send(json.dumps({'type': 'ERROR', 'message': 'Invalid JSON'}))
+                        await websocket.send(json.dumps({'type': 'PONG', 'timestamp': time.time()}))
+                    
+                    else:
+                        logger.warning(f"Unknown action: {action}")
+                        await websocket.send(json.dumps({
+                            'type': 'ERROR',
+                            'message': f'Unknown action: {action}'
+                        }))
+                        
+                except json.JSONDecodeError as e:
+                    logger.error(f"Invalid JSON from {client_info}: {message}")
+                    await websocket.send(json.dumps({
+                        'type': 'ERROR',
+                        'message': 'Invalid JSON'
+                    }))
                     
         except websockets.exceptions.ConnectionClosed as e:
-            logger.info(f"Client disconnected: {e}")
+            logger.info(f"✗ Client disconnected: {client_info} (code={e.code}, reason={e.reason})")
         except Exception as e:
-            logger.error(f"Error handling client: {e}")
+            logger.error(f"Error handling client {client_info}: {e}", exc_info=True)
         finally:
             self.capture.subscribers.discard(websocket)
+            logger.info(f"Cleaned up client: {client_info}")
 
     async def start(self):
         # Setup graceful shutdown
@@ -295,23 +377,35 @@ class WebSocketServer:
             loop.add_signal_handler(sig, shutdown)
         
         # Start WebSocket server
-        logger.info(f"Starting WebSocket server on {HOST}:{PORT}")
+        logger.info("="*60)
+        logger.info(f"Starting WebSocket Server")
+        logger.info(f"Host: {HOST}")
+        logger.info(f"Port: {PORT}")
+        logger.info("="*60)
         
         async with websockets.serve(
             self.handle_client, 
             HOST, 
             PORT,
-            process_request=self.process_request,  # Handle HTTP health checks
+            process_request=self.process_request,
             ping_interval=20,
             ping_timeout=10,
-            compression=None,  # Disable compression to avoid proxy issues
-            subprotocols=None  # Disable subprotocol negotiation
+            max_size=10*1024*1024,  # 10MB max message size
+            compression=None,
+            subprotocols=None
         ) as server:
-            logger.info(f"Server started successfully on ws://{HOST}:{PORT}")
-            logger.info(f"Health check available at http://{HOST}:{PORT}/health")
+            logger.info(f"✓ Server started successfully")
+            logger.info(f"  WebSocket: ws://{HOST}:{PORT}")
+            logger.info(f"  Health: http://{HOST}:{PORT}/health")
+            logger.info(f"  Info: http://{HOST}:{PORT}/")
+            logger.info("="*60)
+            
             await stop
+            
+            logger.info("Shutting down server...")
             server.close()
             await server.wait_closed()
+            logger.info("Server shutdown complete")
 
 
 async def main():
@@ -321,4 +415,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Stopped")
+        logger.info("Stopped by user")
